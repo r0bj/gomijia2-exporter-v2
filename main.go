@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"flag"
 	"fmt"
 	"log/slog"
 	"math"
@@ -14,11 +13,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/pflag"
 	"tinygo.org/x/bluetooth"
 )
 
 const (
-	ver string = "0.1"
+	ver string = "0.2"
 )
 
 var adapter = bluetooth.DefaultAdapter
@@ -28,9 +28,9 @@ var adapterMutex sync.Mutex
 
 // Command line flags
 var (
-	configFile      = flag.String("config-file", "config.ini", "Config file location")
-	listenAddress   = flag.String("web.listen-address", ":8080", "Address to listen on for web interface and telemetry")
-	readingInterval = flag.Int("reading-interval", 60, "Interval between sensor readings in seconds")
+	configFile      = pflag.StringP("config-file", "c", "config.ini", "Config file location")
+	listenAddress   = pflag.StringP("web.listen-address", "l", ":8080", "Address to listen on for web interface and telemetry")
+	readingInterval = pflag.IntP("reading-interval", "i", 60, "Interval between sensor readings in seconds")
 )
 
 // Prometheus metrics
@@ -62,14 +62,14 @@ var (
 )
 
 var (
-	// Custom service UUID for Xiaomi Mijia 2 (based on working version)
+	// Custom service UUID for Xiaomi Mijia 2
 	customSvcUUID = bluetooth.NewUUID([16]byte{0xeb, 0xe0, 0xcc, 0xb0, 0x7a, 0x0a, 0x4b, 0x0c, 0x8a, 0x1a, 0x6f, 0xf2, 0x99, 0x7d, 0xa3, 0xa6})
 	// Custom characteristic UUID for temperature/humidity data
 	tempHumidityUUID = bluetooth.NewUUID([16]byte{0xeb, 0xe0, 0xcc, 0xc1, 0x7a, 0x0a, 0x4b, 0x0c, 0x8a, 0x1a, 0x6f, 0xf2, 0x99, 0x7d, 0xa3, 0xa6})
 )
 
 func main() {
-	flag.Parse()
+	pflag.Parse()
 
 	slog.Info("Starting", "version", ver)
 
