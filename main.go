@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -18,17 +19,16 @@ import (
 )
 
 const (
-	ver string = "0.14"
+	ver string = "0.16"
 )
 
 var adapter = bluetooth.DefaultAdapter
 
 // Discovered device tracking
 type DiscoveredDevice struct {
-	Device      Device
-	Address     bluetooth.Address
-	LastSeen    time.Time
-	Consecutive int // consecutive failures
+	Device   Device
+	Address  bluetooth.Address
+	LastSeen time.Time
 }
 
 // Command line flags
@@ -161,9 +161,26 @@ func discoverDevices(devices []Device) []DiscoveredDevice {
 	// Scan for devices
 	scanTimeout := 15 * time.Second
 	scanDone := make(chan bool, 1)
+	scanCtx, scanCancel := context.WithTimeout(context.Background(), scanTimeout)
+	defer scanCancel()
 
 	go func() {
+		defer func() {
+			// Ensure we always signal completion
+			select {
+			case scanDone <- true:
+			default:
+			}
+		}()
+
 		err := adapter.Scan(func(_ *bluetooth.Adapter, res bluetooth.ScanResult) {
+			// Check if context is cancelled
+			select {
+			case <-scanCtx.Done():
+				return
+			default:
+			}
+
 			addr := strings.ToLower(res.Address.String())
 			if device, exists := deviceMap[addr]; exists {
 				mutex.Lock()
@@ -187,14 +204,13 @@ func discoverDevices(devices []Device) []DiscoveredDevice {
 		if err != nil {
 			slog.Error("Scan error", "error", err)
 		}
-		scanDone <- true
 	}()
 
 	// Wait for scan completion or timeout
 	select {
 	case <-scanDone:
 		slog.Debug("Scan completed normally")
-	case <-time.After(scanTimeout):
+	case <-scanCtx.Done():
 		slog.Debug("Scan timeout reached")
 	}
 
@@ -237,11 +253,9 @@ func readAllDevices(discovered []DiscoveredDevice) {
 
 			success := connectAndReadDevice(device)
 			if !success {
-				device.Consecutive++
 				deviceErrors.WithLabelValues(device.Device.Name).Inc()
-				slog.Warn("Failed to read device", "device", device.Device.Name, "consecutive", device.Consecutive)
+				slog.Warn("Failed to read device", "device", device.Device.Name)
 			} else {
-				device.Consecutive = 0
 				slog.Debug("Successfully read device", "device", device.Device.Name)
 			}
 		}(dev)
@@ -262,24 +276,40 @@ func connectAndReadDevice(discovered DiscoveredDevice) bool {
 	operationDone := make(chan bool, 1)
 	var operationResult bool
 
+	// Create a context for cancellation
+	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+	defer cancel()
+
 	// Run the connection and read operation with timeout
 	go func() {
-		result := performDeviceRead(device, address)
-		operationResult = result
-		operationDone <- true
+		result := performDeviceRead(ctx, device, address)
+		select {
+		case operationDone <- result:
+			operationResult = result
+		case <-ctx.Done():
+			// Context cancelled, don't block on channel
+		}
 	}()
 
 	// Wait for operation completion or timeout
 	select {
 	case <-operationDone:
 		return operationResult
-	case <-time.After(operationTimeout):
+	case <-ctx.Done():
 		slog.Warn("Operation timeout", "device", device.Name, "timeout", operationTimeout)
 		return false
 	}
 }
 
-func performDeviceRead(device Device, address bluetooth.Address) bool {
+func performDeviceRead(ctx context.Context, device Device, address bluetooth.Address) bool {
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		slog.Debug("Context cancelled before starting", "device", device.Name)
+		return false
+	default:
+	}
+
 	// Connect to the device
 	dev, err := adapter.Connect(address, bluetooth.ConnectionParams{})
 	if err != nil {
@@ -287,6 +317,14 @@ func performDeviceRead(device Device, address bluetooth.Address) bool {
 		return false
 	}
 	defer dev.Disconnect()
+
+	// Check context after connection
+	select {
+	case <-ctx.Done():
+		slog.Debug("Context cancelled after connect", "device", device.Name)
+		return false
+	default:
+	}
 
 	slog.Debug("Connected, discovering GATT services", "device", device.Name)
 	svcs, err := dev.DiscoverServices([]bluetooth.UUID{customSvcUUID})
@@ -309,6 +347,14 @@ func performDeviceRead(device Device, address bluetooth.Address) bool {
 		return false
 	}
 	tempChar := chars[0]
+
+	// Check context before notifications
+	select {
+	case <-ctx.Done():
+		slog.Debug("Context cancelled before notifications", "device", device.Name)
+		return false
+	default:
+	}
 
 	slog.Debug("Setting up notifications", "device", device.Name)
 
@@ -333,9 +379,16 @@ func performDeviceRead(device Device, address bluetooth.Address) bool {
 		return false
 	}
 
+	// Ensure notifications are disabled when we're done
+	defer func() {
+		if disableErr := tempChar.EnableNotifications(nil); disableErr != nil {
+			slog.Debug("Failed to disable notifications", "device", device.Name, "error", disableErr)
+		}
+	}()
+
 	slog.Debug("Notifications enabled, waiting for data", "device", device.Name)
 
-	// Wait for data
+	// Wait for data with context cancellation
 	select {
 	case data := <-dataChan:
 		if len(data) != 5 {
@@ -371,6 +424,9 @@ func performDeviceRead(device Device, address bluetooth.Address) bool {
 
 	case <-time.After(6 * time.Second):
 		slog.Warn("Timeout waiting for sensor data", "device", device.Name)
+		return false
+	case <-ctx.Done():
+		slog.Debug("Context cancelled while waiting for data", "device", device.Name)
 		return false
 	}
 }
