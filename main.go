@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +21,7 @@ import (
 )
 
 const (
-	ver string = "0.16"
+	ver string = "0.34"
 )
 
 var adapter = bluetooth.DefaultAdapter
@@ -37,6 +39,7 @@ var (
 	listenAddress   = pflag.StringP("web.listen-address", "l", ":8080", "Address to listen on for web interface and telemetry")
 	readingInterval = pflag.IntP("reading-interval", "i", 60, "Interval between sensor readings in seconds")
 	maxConcurrent   = pflag.IntP("max-concurrent", "m", 3, "Maximum concurrent BLE connections")
+	debug           = pflag.BoolP("debug", "d", false, "Enable debug logging")
 )
 
 // Prometheus metrics
@@ -76,6 +79,13 @@ var (
 
 func main() {
 	pflag.Parse()
+
+	// Configure logging level
+	if *debug {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		})))
+	}
 
 	slog.Info("Starting", "version", ver)
 
@@ -123,11 +133,15 @@ func main() {
 
 func runCollectionLoop(devices []Device) {
 	for {
+		initialGoroutines := runtime.NumGoroutine()
 		slog.Info("Starting discovery and collection cycle")
+		slog.Debug("Goroutine count", "goroutines", initialGoroutines)
 
 		// Phase 1: Discover all devices
 		discovered := discoverDevices(devices)
+		afterDiscovery := runtime.NumGoroutine()
 		slog.Info("Discovery complete", "found", len(discovered), "total", len(devices))
+		slog.Debug("Goroutine count after discovery", "goroutines", afterDiscovery)
 
 		if len(discovered) == 0 {
 			slog.Warn("No devices discovered, waiting before retry")
@@ -137,9 +151,11 @@ func runCollectionLoop(devices []Device) {
 
 		// Phase 2: Connect to all discovered devices in parallel
 		readAllDevices(discovered)
+		afterReading := runtime.NumGoroutine()
 
 		// Wait before next collection cycle
 		slog.Info("Collection cycle complete, waiting for next cycle", "interval", *readingInterval)
+		slog.Debug("Goroutine count after reading", "goroutines", afterReading)
 		time.Sleep(time.Duration(*readingInterval) * time.Second)
 	}
 }
@@ -160,20 +176,17 @@ func discoverDevices(devices []Device) []DiscoveredDevice {
 
 	// Scan for devices
 	scanTimeout := 15 * time.Second
-	scanDone := make(chan bool, 1)
 	scanCtx, scanCancel := context.WithTimeout(context.Background(), scanTimeout)
 	defer scanCancel()
 
-	go func() {
-		defer func() {
-			// Ensure we always signal completion
-			select {
-			case scanDone <- true:
-			default:
-			}
-		}()
+	// Channel to signal scan completion
+	scanDone := make(chan struct{})
+	var scanErr error
 
-		err := adapter.Scan(func(_ *bluetooth.Adapter, res bluetooth.ScanResult) {
+	go func() {
+		defer close(scanDone)
+
+		scanErr = adapter.Scan(func(_ *bluetooth.Adapter, res bluetooth.ScanResult) {
 			// Check if context is cancelled
 			select {
 			case <-scanCtx.Done():
@@ -201,9 +214,6 @@ func discoverDevices(devices []Device) []DiscoveredDevice {
 				mutex.Unlock()
 			}
 		})
-		if err != nil {
-			slog.Error("Scan error", "error", err)
-		}
 	}()
 
 	// Wait for scan completion or timeout
@@ -214,7 +224,15 @@ func discoverDevices(devices []Device) []DiscoveredDevice {
 		slog.Debug("Scan timeout reached")
 	}
 
-	adapter.StopScan()
+	// Always stop scan to clean up resources
+	if stopErr := adapter.StopScan(); stopErr != nil {
+		slog.Debug("Error stopping scan", "error", stopErr)
+	}
+
+	// Log scan errors if any
+	if scanErr != nil {
+		slog.Error("Scan error", "error", scanErr)
+	}
 
 	// Convert map to slice
 	var discovered []DiscoveredDevice
@@ -273,28 +291,28 @@ func connectAndReadDevice(discovered DiscoveredDevice) bool {
 
 	// Set up overall operation timeout
 	operationTimeout := 30 * time.Second
-	operationDone := make(chan bool, 1)
-	var operationResult bool
-
-	// Create a context for cancellation
 	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
 	defer cancel()
 
-	// Run the connection and read operation with timeout
+	// Channel to receive operation result
+	resultChan := make(chan bool, 1)
+
+	// Run the connection and read operation
 	go func() {
-		result := performDeviceRead(ctx, device, address)
-		select {
-		case operationDone <- result:
-			operationResult = result
-		case <-ctx.Done():
-			// Context cancelled, don't block on channel
-		}
+		defer func() {
+			// Ensure we always send a result, even if panics occur
+			select {
+			case resultChan <- performDeviceRead(ctx, device, address):
+			case <-ctx.Done():
+				// Context cancelled, don't block
+			}
+		}()
 	}()
 
 	// Wait for operation completion or timeout
 	select {
-	case <-operationDone:
-		return operationResult
+	case result := <-resultChan:
+		return result
 	case <-ctx.Done():
 		slog.Warn("Operation timeout", "device", device.Name, "timeout", operationTimeout)
 		return false
@@ -316,7 +334,11 @@ func performDeviceRead(ctx context.Context, device Device, address bluetooth.Add
 		slog.Error("Failed to connect to device", "device", device.Name, "error", err)
 		return false
 	}
-	defer dev.Disconnect()
+	defer func() {
+		if disconnectErr := dev.Disconnect(); disconnectErr != nil {
+			slog.Debug("Error disconnecting from device", "device", device.Name, "error", disconnectErr)
+		}
+	}()
 
 	// Check context after connection
 	select {
@@ -360,17 +382,16 @@ func performDeviceRead(ctx context.Context, device Device, address bluetooth.Add
 
 	// Channel to receive notification data
 	dataChan := make(chan []byte, 1)
-	dataReceived := false
+	var notificationEnabled bool
 
 	// Enable notifications (required for Xiaomi Mijia 2 devices)
 	err = tempChar.EnableNotifications(func(buf []byte) {
-		if !dataReceived {
-			select {
-			case dataChan <- buf:
-				dataReceived = true
-			default:
-				// Channel full, drop the data
-			}
+		select {
+		case dataChan <- buf:
+		case <-ctx.Done():
+			// Context cancelled, don't block
+		default:
+			// Channel might be full or closed, don't block
 		}
 	})
 
@@ -378,11 +399,14 @@ func performDeviceRead(ctx context.Context, device Device, address bluetooth.Add
 		slog.Error("Failed to enable notifications", "device", device.Name, "error", err)
 		return false
 	}
+	notificationEnabled = true
 
 	// Ensure notifications are disabled when we're done
 	defer func() {
-		if disableErr := tempChar.EnableNotifications(nil); disableErr != nil {
-			slog.Debug("Failed to disable notifications", "device", device.Name, "error", disableErr)
+		if notificationEnabled {
+			if disableErr := tempChar.EnableNotifications(nil); disableErr != nil {
+				slog.Debug("Failed to disable notifications", "device", device.Name, "error", disableErr)
+			}
 		}
 	}()
 
