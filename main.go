@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -18,19 +21,25 @@ import (
 )
 
 const (
-	ver string = "0.2"
+	ver string = "0.34"
 )
 
 var adapter = bluetooth.DefaultAdapter
 
-// Mutex to synchronize access to the bluetooth adapter
-var adapterMutex sync.Mutex
+// Discovered device tracking
+type DiscoveredDevice struct {
+	Device   Device
+	Address  bluetooth.Address
+	LastSeen time.Time
+}
 
 // Command line flags
 var (
 	configFile      = pflag.StringP("config-file", "c", "config.ini", "Config file location")
 	listenAddress   = pflag.StringP("web.listen-address", "l", ":8080", "Address to listen on for web interface and telemetry")
 	readingInterval = pflag.IntP("reading-interval", "i", 60, "Interval between sensor readings in seconds")
+	maxConcurrent   = pflag.IntP("max-concurrent", "m", 3, "Maximum concurrent BLE connections")
+	debug           = pflag.BoolP("debug", "d", false, "Enable debug logging")
 )
 
 // Prometheus metrics
@@ -71,6 +80,13 @@ var (
 func main() {
 	pflag.Parse()
 
+	// Configure logging level
+	if *debug {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		})))
+	}
+
 	slog.Info("Starting", "version", ver)
 
 	if err := adapter.Enable(); err != nil {
@@ -92,7 +108,8 @@ func main() {
 
 	slog.Info("Application started",
 		"devices", len(config.Devices),
-		"readingInterval", fmt.Sprintf("%ds", *readingInterval))
+		"readingInterval", fmt.Sprintf("%ds", *readingInterval),
+		"maxConcurrent", *maxConcurrent)
 
 	// Initialize metrics for all devices
 	for _, device := range config.Devices {
@@ -110,130 +127,226 @@ func main() {
 		}
 	}()
 
-	// Use WaitGroup to handle multiple devices
-	var wg sync.WaitGroup
-
-	// Start a goroutine for each device with staggered timing
-	for i, device := range config.Devices {
-		wg.Add(1)
-		go func(dev Device, delay int) {
-			defer wg.Done()
-			// Stagger the start times to avoid immediate collisions
-			time.Sleep(time.Duration(delay) * time.Second)
-			handleDevice(dev)
-		}(device, i*10) // 10 second delay between devices
-	}
-
-	// Wait for all devices to complete
-	wg.Wait()
+	// Start the main collection loop
+	runCollectionLoop(config.Devices)
 }
 
-func handleDevice(device Device) {
-	slog.Info("Starting device handler", "device", device.Name, "address", device.Addr)
-
-	consecutiveFailures := 0
+func runCollectionLoop(devices []Device) {
 	for {
-		success := connectAndReadDevice(device)
-		if !success {
-			consecutiveFailures++
+		initialGoroutines := runtime.NumGoroutine()
+		slog.Info("Starting discovery and collection cycle")
+		slog.Debug("Goroutine count", "goroutines", initialGoroutines)
 
-			// Increment error counter
-			deviceErrors.WithLabelValues(device.Name).Inc()
+		// Phase 1: Discover all devices
+		discovered := discoverDevices(devices)
+		afterDiscovery := runtime.NumGoroutine()
+		slog.Info("Discovery complete", "found", len(discovered), "total", len(devices))
+		slog.Debug("Goroutine count after discovery", "goroutines", afterDiscovery)
 
-			// Use longer retry interval for devices that seem to be offline
-			var retryInterval time.Duration
-			if consecutiveFailures >= 3 {
-				retryInterval = 120 * time.Second // 2 minutes for likely offline devices
-				slog.Warn("Device appears to be offline, using longer retry interval",
-					"device", device.Name,
-					"consecutiveFailures", consecutiveFailures,
-					"retryInterval", retryInterval)
-			} else {
-				retryInterval = 30 * time.Second // 30 seconds for temporary failures
-				slog.Info("Device read failed, retrying",
-					"device", device.Name,
-					"retryInterval", retryInterval)
+		if len(discovered) == 0 {
+			slog.Warn("No devices discovered, waiting before retry")
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		// Phase 2: Connect to all discovered devices in parallel
+		readAllDevices(discovered)
+		afterReading := runtime.NumGoroutine()
+
+		// Wait before next collection cycle
+		slog.Info("Collection cycle complete, waiting for next cycle", "interval", *readingInterval)
+		slog.Debug("Goroutine count after reading", "goroutines", afterReading)
+		time.Sleep(time.Duration(*readingInterval) * time.Second)
+	}
+}
+
+func discoverDevices(devices []Device) []DiscoveredDevice {
+	slog.Info("Starting device discovery", "targets", len(devices))
+
+	var mutex sync.Mutex
+
+	// Create a map for quick lookup of target devices
+	deviceMap := make(map[string]Device)
+	for _, device := range devices {
+		deviceMap[strings.ToLower(device.Addr)] = device
+	}
+
+	// Use a map to deduplicate discovered devices
+	discoveredMap := make(map[string]DiscoveredDevice)
+
+	// Scan for devices
+	scanTimeout := 15 * time.Second
+	scanCtx, scanCancel := context.WithTimeout(context.Background(), scanTimeout)
+	defer scanCancel()
+
+	// Channel to signal scan completion
+	scanDone := make(chan struct{})
+	var scanErr error
+
+	go func() {
+		defer close(scanDone)
+
+		scanErr = adapter.Scan(func(_ *bluetooth.Adapter, res bluetooth.ScanResult) {
+			// Check if context is cancelled
+			select {
+			case <-scanCtx.Done():
+				return
+			default:
 			}
 
-			time.Sleep(retryInterval)
-		} else {
-			// Reset failure counter on successful read
-			if consecutiveFailures > 0 {
-				slog.Info("Device is back online",
-					"device", device.Name,
-					"previousFailures", consecutiveFailures)
-				consecutiveFailures = 0
+			addr := strings.ToLower(res.Address.String())
+			if device, exists := deviceMap[addr]; exists {
+				mutex.Lock()
+				// Only add if not already discovered
+				if _, alreadyDiscovered := discoveredMap[addr]; !alreadyDiscovered {
+					discoveredMap[addr] = DiscoveredDevice{
+						Device:   device,
+						Address:  res.Address,
+						LastSeen: time.Now(),
+					}
+					slog.Info("Discovered device", "name", device.Name, "address", res.Address.String())
+				} else {
+					// Just update the last seen time
+					discovered := discoveredMap[addr]
+					discovered.LastSeen = time.Now()
+					discoveredMap[addr] = discovered
+				}
+				mutex.Unlock()
 			}
+		})
+	}()
 
-			// Wait before next reading
-			time.Sleep(time.Duration(*readingInterval) * time.Second)
+	// Wait for scan completion or timeout
+	select {
+	case <-scanDone:
+		slog.Debug("Scan completed normally")
+	case <-scanCtx.Done():
+		slog.Debug("Scan timeout reached")
+	}
+
+	// Always stop scan to clean up resources
+	if stopErr := adapter.StopScan(); stopErr != nil {
+		slog.Debug("Error stopping scan", "error", stopErr)
+	}
+
+	// Log scan errors if any
+	if scanErr != nil {
+		slog.Error("Scan error", "error", scanErr)
+	}
+
+	// Convert map to slice
+	var discovered []DiscoveredDevice
+	for _, device := range discoveredMap {
+		discovered = append(discovered, device)
+	}
+
+	// Check for devices that were expected but not discovered and increment error counter
+	for _, expectedDevice := range devices {
+		addr := strings.ToLower(expectedDevice.Addr)
+		if _, found := discoveredMap[addr]; !found {
+			deviceErrors.WithLabelValues(expectedDevice.Name).Inc()
+			slog.Warn("Device not discovered during scan", "device", expectedDevice.Name, "address", expectedDevice.Addr)
 		}
 	}
+
+	return discovered
 }
 
-func connectAndReadDevice(device Device) bool {
-	// Lock the adapter for exclusive access
-	slog.Debug("Waiting for adapter access", "device", device.Name)
-	adapterMutex.Lock()
-	defer adapterMutex.Unlock()
+func readAllDevices(discovered []DiscoveredDevice) {
+	slog.Info("Starting parallel device reading", "devices", len(discovered))
 
-	slog.Debug("Acquired adapter, starting scan", "device", device.Name, "address", device.Addr)
+	// Create a semaphore to limit concurrent connections
+	sem := make(chan struct{}, *maxConcurrent)
+	var wg sync.WaitGroup
+
+	for _, dev := range discovered {
+		wg.Add(1)
+
+		go func(device DiscoveredDevice) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			success := connectAndReadDevice(device)
+			if !success {
+				deviceErrors.WithLabelValues(device.Device.Name).Inc()
+				slog.Warn("Failed to read device", "device", device.Device.Name)
+			} else {
+				slog.Debug("Successfully read device", "device", device.Device.Name)
+			}
+		}(dev)
+	}
+
+	wg.Wait()
+	slog.Info("Parallel device reading complete")
+}
+
+func connectAndReadDevice(discovered DiscoveredDevice) bool {
+	device := discovered.Device
+	address := discovered.Address
+
+	slog.Debug("Connecting to device", "device", device.Name, "address", address.String())
 
 	// Set up overall operation timeout
-	operationTimeout := 45 * time.Second // Increased timeout for full operation
-	operationDone := make(chan bool, 1)
-	var operationResult bool
+	operationTimeout := 30 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+	defer cancel()
 
-	// Run the entire operation with timeout
+	// Channel to receive operation result
+	resultChan := make(chan bool, 1)
+
+	// Run the connection and read operation
 	go func() {
-		result := performDeviceOperation(device)
-		operationResult = result
-		operationDone <- true
+		defer func() {
+			// Ensure we always send a result, even if panics occur
+			select {
+			case resultChan <- performDeviceRead(ctx, device, address):
+			case <-ctx.Done():
+				// Context cancelled, don't block
+			}
+		}()
 	}()
 
 	// Wait for operation completion or timeout
 	select {
-	case <-operationDone:
-		return operationResult
-	case <-time.After(operationTimeout):
-		slog.Warn("Operation timeout - device may be offline",
-			"device", device.Name,
-			"address", device.Addr,
-			"timeout", operationTimeout)
-		adapter.StopScan() // Stop any ongoing scan
+	case result := <-resultChan:
+		return result
+	case <-ctx.Done():
+		slog.Warn("Operation timeout", "device", device.Name, "timeout", operationTimeout)
 		return false
 	}
 }
 
-func performDeviceOperation(device Device) bool {
-	var dev bluetooth.Device
-	found := false
+func performDeviceRead(ctx context.Context, device Device, address bluetooth.Address) bool {
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		slog.Debug("Context cancelled before starting", "device", device.Name)
+		return false
+	default:
+	}
 
-	// The Scan callback is called for every advertisement.
-	err := adapter.Scan(func(_ *bluetooth.Adapter, res bluetooth.ScanResult) {
-		if strings.EqualFold(res.Address.String(), device.Addr) {
-			slog.Info("Found device, connecting", "device", device.Name, "address", res.Address.String())
-			adapter.StopScan()
-			var err error
-			dev, err = adapter.Connect(res.Address, bluetooth.ConnectionParams{})
-			if err != nil {
-				slog.Error("Failed to connect to device", "device", device.Name, "error", err)
-				return
-			}
-			found = true
-		}
-	})
+	// Connect to the device
+	dev, err := adapter.Connect(address, bluetooth.ConnectionParams{})
 	if err != nil {
-		slog.Error("Scan error", "device", device.Name, "error", err)
+		slog.Error("Failed to connect to device", "device", device.Name, "error", err)
 		return false
 	}
+	defer func() {
+		if disconnectErr := dev.Disconnect(); disconnectErr != nil {
+			slog.Debug("Error disconnecting from device", "device", device.Name, "error", disconnectErr)
+		}
+	}()
 
-	// If Scan returned without having set 'found', nothing was discovered.
-	if !found {
-		slog.Debug("Device not discovered within scan window", "device", device.Name, "address", device.Addr)
+	// Check context after connection
+	select {
+	case <-ctx.Done():
+		slog.Debug("Context cancelled after connect", "device", device.Name)
 		return false
+	default:
 	}
-	defer dev.Disconnect()
 
 	slog.Debug("Connected, discovering GATT services", "device", device.Name)
 	svcs, err := dev.DiscoverServices([]bluetooth.UUID{customSvcUUID})
@@ -257,21 +370,28 @@ func performDeviceOperation(device Device) bool {
 	}
 	tempChar := chars[0]
 
+	// Check context before notifications
+	select {
+	case <-ctx.Done():
+		slog.Debug("Context cancelled before notifications", "device", device.Name)
+		return false
+	default:
+	}
+
 	slog.Debug("Setting up notifications", "device", device.Name)
 
 	// Channel to receive notification data
 	dataChan := make(chan []byte, 1)
-	dataReceived := false
+	var notificationEnabled bool
 
 	// Enable notifications (required for Xiaomi Mijia 2 devices)
 	err = tempChar.EnableNotifications(func(buf []byte) {
-		if !dataReceived {
-			select {
-			case dataChan <- buf:
-				dataReceived = true
-			default:
-				// Channel full, drop the data
-			}
+		select {
+		case dataChan <- buf:
+		case <-ctx.Done():
+			// Context cancelled, don't block
+		default:
+			// Channel might be full or closed, don't block
 		}
 	})
 
@@ -279,10 +399,20 @@ func performDeviceOperation(device Device) bool {
 		slog.Error("Failed to enable notifications", "device", device.Name, "error", err)
 		return false
 	}
+	notificationEnabled = true
+
+	// Ensure notifications are disabled when we're done
+	defer func() {
+		if notificationEnabled {
+			if disableErr := tempChar.EnableNotifications(nil); disableErr != nil {
+				slog.Debug("Failed to disable notifications", "device", device.Name, "error", disableErr)
+			}
+		}
+	}()
 
 	slog.Debug("Notifications enabled, waiting for data", "device", device.Name)
 
-	// Wait for data
+	// Wait for data with context cancellation
 	select {
 	case data := <-dataChan:
 		if len(data) != 5 {
@@ -313,11 +443,14 @@ func performDeviceOperation(device Device) bool {
 			"battery", fmt.Sprintf("%.1f", batteryPercent),
 			"timestamp", time.Now().Format(time.RFC3339))
 
-		slog.Debug("Sensor data received, disconnecting immediately", "device", device.Name)
+		slog.Debug("Sensor data received, disconnecting", "device", device.Name)
 		return true
 
 	case <-time.After(6 * time.Second):
 		slog.Warn("Timeout waiting for sensor data", "device", device.Name)
+		return false
+	case <-ctx.Done():
+		slog.Debug("Context cancelled while waiting for data", "device", device.Name)
 		return false
 	}
 }
